@@ -1,0 +1,271 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>PoliCita</title>
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #f0f2f5;
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+    }
+    header {
+      background: #2c5f8a;
+      color: white;
+      padding: 16px 24px;
+      font-size: 1.2rem;
+      font-weight: 600;
+    }
+    #chat-window {
+      flex: 1;
+      overflow-y: auto;
+      padding: 24px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+    .message {
+      max-width: 70%;
+      padding: 12px 16px;
+      border-radius: 18px;
+      line-height: 1.5;
+      font-size: 0.95rem;
+    }
+    .user {
+      background: #2c5f8a;
+      color: white;
+      align-self: flex-end;
+      border-bottom-right-radius: 4px;
+      white-space: pre-wrap;
+    }
+    .agent {
+      background: white;
+      color: #1a1a1a;
+      align-self: flex-start;
+      border-bottom-left-radius: 4px;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+    }
+
+    /* Markdown styles inside agent bubbles */
+    .agent p { margin-bottom: 8px; }
+    .agent p:last-child { margin-bottom: 0; }
+    .agent ul, .agent ol { margin: 8px 0 8px 20px; }
+    .agent li { margin-bottom: 4px; }
+    .agent strong { font-weight: 600; }
+    .agent em { font-style: italic; }
+    .agent code {
+      background: #f0f2f5;
+      padding: 2px 6px;
+      border-radius: 4px;
+      font-family: monospace;
+      font-size: 0.875rem;
+    }
+    .agent pre {
+      background: #1a1a1a;
+      color: #f0f2f5;
+      padding: 12px;
+      border-radius: 8px;
+      overflow-x: auto;
+      margin: 8px 0;
+    }
+    .agent pre code {
+      background: none;
+      padding: 0;
+      color: inherit;
+    }
+    .agent h1, .agent h2, .agent h3 {
+      margin: 10px 0 6px;
+      font-weight: 600;
+    }
+    .agent blockquote {
+      border-left: 3px solid #2c5f8a;
+      padding-left: 10px;
+      color: #555;
+      margin: 8px 0;
+    }
+    .agent a { color: #2c5f8a; text-decoration: underline; }
+
+    /* Typing indicator */
+    .typing-bubble {
+      background: white;
+      align-self: flex-start;
+      border-radius: 18px;
+      border-bottom-left-radius: 4px;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+      padding: 14px 18px;
+      display: flex;
+      align-items: center;
+      gap: 5px;
+    }
+    .typing-bubble span {
+      width: 8px;
+      height: 8px;
+      background: #2c5f8a;
+      border-radius: 50%;
+      display: inline-block;
+      animation: bounce 1.2s infinite;
+    }
+    .typing-bubble span:nth-child(2) { animation-delay: 0.2s; }
+    .typing-bubble span:nth-child(3) { animation-delay: 0.4s; }
+    @keyframes bounce {
+      0%, 60%, 100% { transform: translateY(0); opacity: 0.4; }
+      30% { transform: translateY(-6px); opacity: 1; }
+    }
+
+    #input-area {
+      display: flex;
+      padding: 16px;
+      background: white;
+      border-top: 1px solid #ddd;
+      gap: 10px;
+    }
+    #user-input {
+      flex: 1;
+      padding: 12px 16px;
+      border: 1px solid #ccc;
+      border-radius: 24px;
+      font-size: 0.95rem;
+      outline: none;
+    }
+    #user-input:focus { border-color: #2c5f8a; }
+    #send-btn {
+      background: #2c5f8a;
+      color: white;
+      border: none;
+      border-radius: 24px;
+      padding: 12px 24px;
+      font-size: 0.95rem;
+      cursor: pointer;
+    }
+    #send-btn:hover { background: #244f76; }
+    #send-btn:disabled { background: #aaa; cursor: not-allowed; }
+  </style>
+</head>
+<body>
+  <header>PoliCita</header>
+  <div id="chat-window"></div>
+  <div id="input-area">
+    <input id="user-input" type="text" placeholder="Ask PoliCita something..." autocomplete="off" />
+    <button id="send-btn">Send</button>
+  </div>
+
+  <script>
+    const chatWindow = document.getElementById("chat-window");
+    const userInput = document.getElementById("user-input");
+    const sendBtn = document.getElementById("send-btn");
+    let conversationHistory = [];
+
+    marked.setOptions({ breaks: true });
+
+    function addMessage(text, role) {
+      const div = document.createElement("div");
+      div.className = `message ${role}`;
+      if (role === "agent") {
+        div.innerHTML = marked.parse(text || "");
+      } else {
+        div.textContent = text;
+      }
+      chatWindow.appendChild(div);
+      chatWindow.scrollTop = chatWindow.scrollHeight;
+      return div;
+    }
+
+    function addTypingIndicator() {
+      const div = document.createElement("div");
+      div.className = "typing-bubble";
+      div.id = "typing-indicator";
+      div.innerHTML = "<span></span><span></span><span></span>";
+      chatWindow.appendChild(div);
+      chatWindow.scrollTop = chatWindow.scrollHeight;
+      return div;
+    }
+
+    async function sendMessage() {
+      const message = userInput.value.trim();
+      if (!message) return;
+
+      userInput.value = "";
+      sendBtn.disabled = true;
+      addMessage(message, "user");
+
+      const typingDiv = addTypingIndicator();
+
+      try {
+        const response = await fetch("/api/chat", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ message, conversation_history: conversationHistory }),
+        });
+
+        if (!response.ok) {
+          typingDiv.remove();
+          const data = await response.json();
+          addMessage(`Error: ${data.detail}`, "agent");
+          return;
+        }
+
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let fullReply = "";
+        let agentDiv = null;
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+
+          const chunk = decoder.decode(value, { stream: true });
+          const lines = chunk.split("\n");
+
+          for (const line of lines) {
+            if (!line.startsWith("data: ")) continue;
+            const data = line.slice(6).trim();
+            if (data === "[DONE]") continue;
+
+            try {
+              const parsed = JSON.parse(data);
+              const token = parsed.choices?.[0]?.delta?.content;
+              if (token) {
+                // Remove typing indicator on first token
+                if (!agentDiv) {
+                  typingDiv.remove();
+                  agentDiv = addMessage("", "agent");
+                }
+                fullReply += token;
+                agentDiv.innerHTML = marked.parse(fullReply);
+                chatWindow.scrollTop = chatWindow.scrollHeight;
+              }
+            } catch {
+              // skip malformed chunks
+            }
+          }
+        }
+
+        if (!agentDiv) {
+          typingDiv.remove();
+          agentDiv = addMessage("", "agent");
+        }
+
+        conversationHistory.push({ role: "user", content: message });
+        conversationHistory.push({ role: "assistant", content: fullReply });
+
+      } catch (err) {
+        typingDiv.remove();
+        addMessage("Something went wrong. Check the server logs.", "agent");
+      } finally {
+        sendBtn.disabled = false;
+        userInput.focus();
+      }
+    }
+
+    sendBtn.addEventListener("click", sendMessage);
+    userInput.addEventListener("keydown", e => {
+      if (e.key === "Enter") sendMessage();
+    });
+  </script>
+</body>
+</html>
