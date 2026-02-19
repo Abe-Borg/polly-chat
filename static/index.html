@@ -807,7 +807,48 @@
 
     function scrollToBottom() {
       requestAnimationFrame(() => {
-        chatWindow.scrollTop = chatWindow.scrollHeight;
+        chatWindow.scrollTo({ top: chatWindow.scrollHeight, behavior: "smooth" });
+      });
+    }
+
+    // ── Render scheduling for smooth streaming ──
+    let renderDirty = false;
+    let renderBubble = null;
+    let renderText = "";
+    let renderRAF = null;
+    let scrollInterval = null;
+
+    function scheduleRender(bubble, text) {
+      renderBubble = bubble;
+      renderText = text;
+      if (!renderDirty) {
+        renderDirty = true;
+        renderRAF = requestAnimationFrame(flushRender);
+      }
+    }
+
+    function flushRender() {
+      if (renderBubble) {
+        renderBubble.innerHTML = parseMarkdown(renderText);
+      }
+      renderDirty = false;
+    }
+
+    function startScrollInterval() {
+      if (scrollInterval) return;
+      scrollInterval = setInterval(() => {
+        chatWindow.scrollTo({ top: chatWindow.scrollHeight, behavior: "smooth" });
+      }, 120);
+    }
+
+    function stopScrollInterval() {
+      if (scrollInterval) {
+        clearInterval(scrollInterval);
+        scrollInterval = null;
+      }
+      // One final scroll to ensure we're at the bottom
+      requestAnimationFrame(() => {
+        chatWindow.scrollTo({ top: chatWindow.scrollHeight, behavior: "smooth" });
       });
     }
 
@@ -872,6 +913,8 @@
         let fullReply = "";
         let agentBubble = null;
 
+        startScrollInterval();
+
         while (true) {
           const { done, value } = await reader.read();
           if (done) break;
@@ -893,13 +936,19 @@
                   agentBubble = addMessageRow("", "agent");
                 }
                 fullReply += token;
-                agentBubble.innerHTML = parseMarkdown(fullReply);
-                scrollToBottom();
+                scheduleRender(agentBubble, fullReply);
               }
             } catch {
               // skip malformed chunks
             }
           }
+        }
+
+        stopScrollInterval();
+
+        // Final render to ensure complete markdown is displayed
+        if (agentBubble) {
+          agentBubble.innerHTML = parseMarkdown(fullReply);
         }
 
         if (!agentBubble) {
@@ -924,6 +973,8 @@
           addMessageRow("Something went wrong. Please check the server and try again.", "agent");
         }
       } finally {
+        stopScrollInterval();
+        if (renderRAF) { cancelAnimationFrame(renderRAF); renderDirty = false; }
         isStreaming = false;
         abortController = null;
         sendBtn.disabled = false;
