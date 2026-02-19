@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="en" data-theme="light">
+<html lang="en" data-theme="light" data-font="small">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
@@ -118,6 +118,11 @@
     }
     ::-webkit-scrollbar-thumb:hover { opacity: 0.8; }
 
+    /* ── Font Size Scaling ── */
+    [data-font="small"]  { --font-scale: 0.925rem; --font-scale-code: 0.84rem; --font-scale-input: 0.925rem; }
+    [data-font="medium"] { --font-scale: 1.05rem;  --font-scale-code: 0.95rem; --font-scale-input: 1.05rem;  }
+    [data-font="large"]  { --font-scale: 1.18rem;  --font-scale-code: 1.06rem; --font-scale-input: 1.18rem;  }
+
     /* ── Header ── */
     header {
       background: var(--bg-header);
@@ -216,7 +221,7 @@
     .message {
       max-width: 85%;
       line-height: 1.65;
-      font-size: 0.925rem;
+      font-size: var(--font-scale, 0.925rem);
       letter-spacing: 0.005em;
     }
 
@@ -255,7 +260,7 @@
 
     .agent .message-content code {
       font-family: var(--font-mono);
-      font-size: 0.84rem;
+      font-size: var(--font-scale-code, 0.84rem);
       background: var(--bg-inline-code);
       padding: 2px 7px;
       border-radius: 5px;
@@ -269,7 +274,7 @@
       border-radius: 10px;
       overflow: hidden;
       margin: 12px 0;
-      font-size: 0.84rem;
+      font-size: var(--font-scale-code, 0.84rem);
     }
 
     .pre-header {
@@ -504,7 +509,7 @@
       flex: 1;
       border: none;
       outline: none;
-      font-size: 0.925rem;
+      font-size: var(--font-scale-input, 0.925rem);
       font-family: var(--font-body);
       line-height: 1.5;
       resize: none;
@@ -600,6 +605,11 @@
       <button class="icon-btn" id="new-chat-btn" title="New chat">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
           <path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 013 3L7 19l-4 1 1-4 12.5-12.5z"/>
+        </svg>
+      </button>
+      <button class="icon-btn" id="font-size-btn" title="Increase font size">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <polyline points="4 7 4 4 20 4 20 7"/><line x1="9" y1="20" x2="15" y2="20"/><line x1="12" y1="4" x2="12" y2="20"/>
         </svg>
       </button>
       <button class="icon-btn" id="theme-btn" title="Toggle theme">
@@ -711,6 +721,26 @@
     const savedTheme = localStorage.getItem("policita-theme") ||
       (window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
     setTheme(savedTheme);
+
+    // ── Font Size ──
+    const fontSizes = ["small", "medium", "large"];
+    const fontLabels = { small: "Default font", medium: "Medium font", large: "Large font" };
+    const fontSizeBtn = document.getElementById("font-size-btn");
+
+    function setFontSize(size) {
+      document.documentElement.setAttribute("data-font", size);
+      localStorage.setItem("policita-font-size", size);
+      fontSizeBtn.title = fontLabels[size];
+    }
+
+    fontSizeBtn.addEventListener("click", () => {
+      const current = document.documentElement.getAttribute("data-font") || "small";
+      const nextIdx = (fontSizes.indexOf(current) + 1) % fontSizes.length;
+      setFontSize(fontSizes[nextIdx]);
+    });
+
+    const savedFontSize = localStorage.getItem("policita-font-size") || "small";
+    setFontSize(savedFontSize);
 
     // ── New chat ──
     newChatBtn.addEventListener("click", () => {
