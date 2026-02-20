@@ -54,6 +54,7 @@
       --stop-btn-hover: #c43d33;
       --copy-btn-bg: rgba(255,255,255,0.08);
       --copy-btn-hover: rgba(255,255,255,0.15);
+      --cursor-color: #2c5f8a;
     }
 
     [data-theme="dark"] {
@@ -92,6 +93,7 @@
       --stop-btn-hover: #c43d33;
       --copy-btn-bg: rgba(255,255,255,0.06);
       --copy-btn-hover: rgba(255,255,255,0.12);
+      --cursor-color: #4a90c4;
     }
 
     /* ── Reset & Base ── */
@@ -196,8 +198,9 @@
       display: flex;
       flex-direction: column;
       gap: 6px;
-      scroll-behavior: smooth;
       background: var(--bg-chat);
+      /* Scroll anchoring: keep older messages stable */
+      overflow-anchor: auto;
     }
 
     /* Center content with max-width */
@@ -207,6 +210,15 @@
       width: 100%;
       margin: 0 auto;
       animation: msgIn 0.3s var(--ease-out-expo) both;
+      /* CSS containment: isolate reflow to this container */
+      contain: layout style paint;
+      overflow-anchor: none;
+    }
+
+    /* Scroll anchor target at the bottom */
+    .scroll-anchor {
+      overflow-anchor: auto;
+      height: 1px;
     }
 
     @keyframes msgIn {
@@ -237,6 +249,43 @@
     .agent .message-content {
       color: var(--text-agent);
       padding: 6px 0;
+    }
+
+    /* ── Completed messages: skip off-screen rendering ── */
+    .message-row.completed {
+      content-visibility: auto;
+      contain-intrinsic-size: auto 80px;
+    }
+
+    /* ── Streaming message: always visible ── */
+    .message-row.streaming {
+      content-visibility: visible;
+      will-change: contents;
+    }
+
+    /* ── Streaming cursor ── */
+    .streaming-cursor::after {
+      content: '▋';
+      display: inline;
+      margin-left: 1px;
+      color: var(--cursor-color);
+      animation: cursorBlink 1s step-end infinite;
+      font-weight: 400;
+    }
+
+    @keyframes cursorBlink {
+      0%, 50% { opacity: 1; }
+      50.1%, 100% { opacity: 0; }
+    }
+
+    /* Hide cursor when streaming finishes */
+    .message-row.completed .streaming-cursor::after {
+      display: none;
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      .streaming-cursor::after { animation: none; }
+      .message-row { animation: none; }
     }
 
     /* ── Agent Markdown Styles ── */
@@ -659,7 +708,6 @@
     const inputActions = document.getElementById("input-actions");
     const themeBtn = document.getElementById("theme-btn");
     const newChatBtn = document.getElementById("new-chat-btn");
-    const welcomeScreen = document.getElementById("welcome-screen");
 
     let conversationHistory = [];
     let abortController = null;
@@ -673,10 +721,8 @@
       mangle: false,
     });
 
-    // Custom renderer to add copy buttons and language labels to code blocks
     const renderer = new marked.Renderer();
     renderer.code = function(code, language) {
-      // marked v5+ passes an object; earlier versions pass (code, language)
       let text, lang;
       if (typeof code === "object" && code !== null) {
         text = code.text || "";
@@ -717,7 +763,6 @@
       setTheme(current === "light" ? "dark" : "light");
     });
 
-    // Init theme from preference
     const savedTheme = localStorage.getItem("policita-theme") ||
       (window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
     setTheme(savedTheme);
@@ -744,6 +789,7 @@
 
     // ── New chat ──
     newChatBtn.addEventListener("click", () => {
+      if (isStreaming) stopGeneration();
       conversationHistory = [];
       chatWindow.innerHTML = "";
       chatWindow.appendChild(createWelcomeScreen());
@@ -787,9 +833,160 @@
       userInput.style.height = Math.min(userInput.scrollHeight, 160) + "px";
     });
 
-    // ── Message building ──
+    // ══════════════════════════════════════════════════════
+    // ── BUTTER-SMOOTH STREAMING ENGINE ──
+    // ══════════════════════════════════════════════════════
+
+    /**
+     * Frame-paced token renderer.
+     * Tokens are pushed into a string queue from the network.
+     * A requestAnimationFrame loop drains the queue at an adaptive rate:
+     *   - baseCps when backlog is small (smooth typewriter feel)
+     *   - scales up to maxCps when backlog grows (so we don't lag behind)
+     * Only one DOM write per frame (appending to a Text node).
+     */
+    function createPacedRenderer(textNode) {
+      const BASE_CPS = 80;   // chars/sec at steady state
+      const MAX_CPS = 600;   // chars/sec when catching up
+      let queue = "";
+      let running = false;
+      let lastT = 0;
+
+      function push(text) {
+        queue += text;
+        if (!running) {
+          running = true;
+          lastT = performance.now();
+          requestAnimationFrame(tick);
+        }
+      }
+
+      function tick(now) {
+        const dt = Math.min(100, now - lastT); // cap dt to avoid huge jumps
+        lastT = now;
+
+        // Adaptive pacing: speed up when falling behind
+        const backlog = queue.length;
+        let cps;
+        if (backlog < 60) cps = BASE_CPS;
+        else if (backlog < 300) cps = BASE_CPS * 3;
+        else cps = MAX_CPS;
+
+        const charsThisFrame = Math.max(1, Math.floor((cps * dt) / 1000));
+        const chunk = queue.slice(0, charsThisFrame);
+        queue = queue.slice(charsThisFrame);
+
+        // Single DOM write per frame: append to Text node
+        if (chunk) {
+          textNode.data += chunk;
+        }
+
+        if (queue.length > 0) {
+          requestAnimationFrame(tick);
+        } else {
+          running = false;
+        }
+      }
+
+      function flush() {
+        // Immediately dump remaining queue (used on stream end)
+        if (queue.length > 0) {
+          textNode.data += queue;
+          queue = "";
+        }
+        running = false;
+      }
+
+      function pending() {
+        return queue.length;
+      }
+
+      return { push, flush, pending };
+    }
+
+    /**
+     * Smart auto-scroller using MutationObserver + wheel detection.
+     * - Wheel-up pauses auto-scroll (user is reading)
+     * - Near-bottom resumes auto-scroll
+     * - Uses instant scroll during streaming (no smooth queue buildup)
+     * - MutationObserver reacts to actual DOM changes, not React state
+     */
+    function createAutoScroller(container) {
+      let shouldAutoScroll = true;
+
+      // Detect user scrolling UP via wheel event (not scroll event)
+      container.addEventListener("wheel", (e) => {
+        if (e.deltaY < 0) {
+          // Scrolling up → user wants to read, pause auto-scroll
+          shouldAutoScroll = false;
+        } else {
+          // Scrolling down → check if near bottom to resume
+          const { scrollHeight, clientHeight, scrollTop } = container;
+          if (scrollHeight - clientHeight - scrollTop < 150) {
+            shouldAutoScroll = true;
+          }
+        }
+      }, { passive: true });
+
+      // Touch support for mobile
+      let touchStartY = 0;
+      container.addEventListener("touchstart", (e) => {
+        touchStartY = e.touches[0].clientY;
+      }, { passive: true });
+
+      container.addEventListener("touchmove", (e) => {
+        const deltaY = touchStartY - e.touches[0].clientY;
+        if (deltaY < -10) {
+          shouldAutoScroll = false; // swiping down (scrolling up)
+        } else if (deltaY > 10) {
+          const { scrollHeight, clientHeight, scrollTop } = container;
+          if (scrollHeight - clientHeight - scrollTop < 150) {
+            shouldAutoScroll = true;
+          }
+        }
+        touchStartY = e.touches[0].clientY;
+      }, { passive: true });
+
+      // MutationObserver: scroll on actual DOM changes
+      const observer = new MutationObserver(() => {
+        if (shouldAutoScroll) {
+          // Instant scroll during streaming — no smooth animation queue buildup
+          container.scrollTop = container.scrollHeight;
+        }
+      });
+
+      function start() {
+        shouldAutoScroll = true;
+        observer.observe(container, {
+          childList: true,
+          subtree: true,
+          characterData: true,
+        });
+      }
+
+      function stop() {
+        observer.disconnect();
+        // One final smooth scroll to land at the bottom
+        requestAnimationFrame(() => {
+          container.scrollTo({ top: container.scrollHeight, behavior: "smooth" });
+        });
+      }
+
+      function reset() {
+        shouldAutoScroll = true;
+      }
+
+      return { start, stop, reset };
+    }
+
+    // Create the auto-scroller instance
+    const autoScroller = createAutoScroller(chatWindow);
+
+    // ══════════════════════════════════════════════════════
+    // ── MESSAGE BUILDING ──
+    // ══════════════════════════════════════════════════════
+
     function addMessageRow(content, role) {
-      // Remove welcome screen on first message
       const welcome = document.getElementById("welcome-screen");
       if (welcome) welcome.remove();
 
@@ -811,8 +1008,49 @@
       msg.appendChild(bubble);
       row.appendChild(msg);
       chatWindow.appendChild(row);
-      scrollToBottom();
-      return bubble;
+
+      // Mark as completed immediately for non-streaming messages
+      if (role === "user") {
+        row.classList.add("completed");
+      }
+
+      chatWindow.scrollTop = chatWindow.scrollHeight;
+      return { row, bubble };
+    }
+
+    /**
+     * Creates a streaming agent message with:
+     * - A Text node for the pacer to write into (plain text during streaming)
+     * - A cursor span that blinks inline after the text
+     * - The row marked as "streaming" for CSS containment
+     */
+    function addStreamingRow() {
+      const welcome = document.getElementById("welcome-screen");
+      if (welcome) welcome.remove();
+
+      const row = document.createElement("div");
+      row.className = "message-row agent-row streaming";
+
+      const msg = document.createElement("div");
+      msg.className = "message agent";
+
+      const bubble = document.createElement("div");
+      bubble.className = "message-content";
+
+      // Plain text node — the pacer appends to this
+      const textNode = document.createTextNode("");
+      bubble.appendChild(textNode);
+
+      // Blinking cursor follows the text inline
+      const cursor = document.createElement("span");
+      cursor.className = "streaming-cursor";
+      bubble.appendChild(cursor);
+
+      msg.appendChild(bubble);
+      row.appendChild(msg);
+      chatWindow.appendChild(row);
+
+      return { row, bubble, textNode, cursor };
     }
 
     function addTypingIndicator() {
@@ -821,65 +1059,17 @@
       row.id = "typing-indicator";
       row.innerHTML = `<div class="typing-indicator"><span></span><span></span><span></span></div>`;
       chatWindow.appendChild(row);
-      scrollToBottom();
+      chatWindow.scrollTop = chatWindow.scrollHeight;
       return row;
     }
 
     function parseMarkdown(text) {
       try {
-        // Strip agent citation markers like [[C1]], [[C2]], etc.
         const cleaned = text.replace(/\[\[C\d+\]\]/g, "");
         return marked.parse(cleaned);
       } catch {
         return text;
       }
-    }
-
-    function scrollToBottom() {
-      requestAnimationFrame(() => {
-        chatWindow.scrollTo({ top: chatWindow.scrollHeight, behavior: "smooth" });
-      });
-    }
-
-    // ── Render scheduling for smooth streaming ──
-    let renderDirty = false;
-    let renderBubble = null;
-    let renderText = "";
-    let renderRAF = null;
-    let scrollInterval = null;
-
-    function scheduleRender(bubble, text) {
-      renderBubble = bubble;
-      renderText = text;
-      if (!renderDirty) {
-        renderDirty = true;
-        renderRAF = requestAnimationFrame(flushRender);
-      }
-    }
-
-    function flushRender() {
-      if (renderBubble) {
-        renderBubble.innerHTML = parseMarkdown(renderText);
-      }
-      renderDirty = false;
-    }
-
-    function startScrollInterval() {
-      if (scrollInterval) return;
-      scrollInterval = setInterval(() => {
-        chatWindow.scrollTo({ top: chatWindow.scrollHeight, behavior: "smooth" });
-      }, 120);
-    }
-
-    function stopScrollInterval() {
-      if (scrollInterval) {
-        clearInterval(scrollInterval);
-        scrollInterval = null;
-      }
-      // One final scroll to ensure we're at the bottom
-      requestAnimationFrame(() => {
-        chatWindow.scrollTo({ top: chatWindow.scrollHeight, behavior: "smooth" });
-      });
     }
 
     // ── Stop button ──
@@ -907,7 +1097,10 @@
       }
     }
 
-    // ── Send message ──
+    // ══════════════════════════════════════════════════════
+    // ── SEND MESSAGE (main streaming loop) ──
+    // ══════════════════════════════════════════════════════
+
     async function sendMessage() {
       const message = userInput.value.trim();
       if (!message || isStreaming) return;
@@ -922,6 +1115,10 @@
       showStopButton();
 
       abortController = new AbortController();
+
+      let streamRow = null;
+      let pacer = null;
+      let fullReply = "";
 
       try {
         const response = await fetch("/api/chat", {
@@ -940,71 +1137,97 @@
 
         const reader = response.body.getReader();
         const decoder = new TextDecoder();
-        let fullReply = "";
-        let agentBubble = null;
+        let sseBuffer = "";
 
-        startScrollInterval();
+        // Start auto-scroller (MutationObserver)
+        autoScroller.start();
 
         while (true) {
           const { done, value } = await reader.read();
           if (done) break;
 
-          const chunk = decoder.decode(value, { stream: true });
-          const lines = chunk.split("\n");
+          // Accumulate into SSE buffer for proper line parsing
+          sseBuffer += decoder.decode(value, { stream: true });
+          const parts = sseBuffer.split("\n");
+          // Keep the last incomplete line in the buffer
+          sseBuffer = parts.pop() || "";
 
-          for (const line of lines) {
+          for (const line of parts) {
             if (!line.startsWith("data: ")) continue;
             const data = line.slice(6).trim();
             if (data === "[DONE]") continue;
+            // Skip SSE comments (keep-alive)
+            if (line.startsWith(":")) continue;
 
             try {
               const parsed = JSON.parse(data);
               const token = parsed.choices?.[0]?.delta?.content;
               if (token) {
-                if (!agentBubble) {
+                // First token: swap typing indicator for streaming row
+                if (!streamRow) {
                   typingDiv.remove();
-                  agentBubble = addMessageRow("", "agent");
+                  const sr = addStreamingRow();
+                  streamRow = sr;
+                  pacer = createPacedRenderer(sr.textNode);
                 }
                 fullReply += token;
-                scheduleRender(agentBubble, fullReply);
+                // Push to buffer — pacer drains on rAF schedule
+                pacer.push(token);
               }
             } catch {
-              // skip malformed chunks
+              // skip malformed SSE chunks
             }
           }
         }
 
-        stopScrollInterval();
+        // ── Stream complete ──
+        autoScroller.stop();
 
-        // Final render to ensure complete markdown is displayed
-        if (agentBubble) {
-          agentBubble.innerHTML = parseMarkdown(fullReply);
+        if (pacer) {
+          // Flush any remaining buffered characters
+          pacer.flush();
         }
 
-        if (!agentBubble) {
+        if (streamRow) {
+          // Remove cursor
+          streamRow.cursor.remove();
+          // Mark row as completed (enables content-visibility: auto)
+          streamRow.row.classList.remove("streaming");
+          streamRow.row.classList.add("completed");
+          // Single full markdown parse + replace
+          streamRow.bubble.innerHTML = parseMarkdown(fullReply);
+        }
+
+        if (!streamRow) {
           typingDiv.remove();
-          agentBubble = addMessageRow("", "agent");
+          addMessageRow("No response received.", "agent");
         }
 
         conversationHistory.push({ role: "user", content: message });
         conversationHistory.push({ role: "assistant", content: fullReply });
 
       } catch (err) {
-        typingDiv.remove();
+        autoScroller.stop();
+
+        if (typingDiv.parentNode) typingDiv.remove();
+
         if (err.name === "AbortError") {
-          // User stopped generation — keep partial response in history if any
-          const partial = document.querySelector(".agent-row:last-child .message-content");
-          const partialText = partial?.textContent || "";
-          if (partialText) {
+          // User stopped — flush pacer and finalize partial response
+          if (pacer) pacer.flush();
+          if (streamRow) {
+            streamRow.cursor.remove();
+            streamRow.row.classList.remove("streaming");
+            streamRow.row.classList.add("completed");
+            streamRow.bubble.innerHTML = parseMarkdown(fullReply);
+          }
+          if (fullReply) {
             conversationHistory.push({ role: "user", content: message });
-            conversationHistory.push({ role: "assistant", content: partialText });
+            conversationHistory.push({ role: "assistant", content: fullReply });
           }
         } else {
           addMessageRow("Something went wrong. Please check the server and try again.", "agent");
         }
       } finally {
-        stopScrollInterval();
-        if (renderRAF) { cancelAnimationFrame(renderRAF); renderDirty = false; }
         isStreaming = false;
         abortController = null;
         sendBtn.disabled = false;
