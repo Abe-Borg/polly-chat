@@ -632,6 +632,45 @@
       opacity: 0.7;
     }
 
+    /* ── "See latest" pill ── */
+    .scroll-to-bottom {
+      position: fixed;
+      bottom: 100px;
+      left: 50%;
+      transform: translateX(-50%) translateY(20px);
+      background: var(--bg-secondary);
+      color: var(--accent);
+      border: 1px solid var(--border-color);
+      border-radius: 20px;
+      padding: 8px 18px 8px 14px;
+      font-family: var(--font-body);
+      font-size: 0.84rem;
+      font-weight: 500;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      box-shadow: var(--shadow-lg);
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 0.25s ease, transform 0.25s var(--ease-out-expo);
+      z-index: 20;
+    }
+    .scroll-to-bottom.visible {
+      opacity: 1;
+      pointer-events: auto;
+      transform: translateX(-50%) translateY(0);
+    }
+    .scroll-to-bottom:hover {
+      background: var(--accent-subtle);
+      border-color: var(--accent);
+    }
+    .scroll-to-bottom svg {
+      width: 16px;
+      height: 16px;
+      flex-shrink: 0;
+    }
+
     /* ── Mobile ── */
     @media (max-width: 640px) {
       header { padding: 12px 16px; }
@@ -685,6 +724,13 @@
       </div>
     </div>
   </div>
+
+  <button class="scroll-to-bottom" id="scroll-to-bottom-btn">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+      <line x1="12" y1="5" x2="12" y2="19"/><polyline points="19 12 12 19 5 12"/>
+    </svg>
+    See latest
+  </button>
 
   <div id="input-area">
     <div class="input-wrapper">
@@ -907,23 +953,50 @@
     /**
      * Smart auto-scroller using MutationObserver + wheel detection.
      * - Wheel-up pauses auto-scroll (user is reading)
-     * - Near-bottom resumes auto-scroll
+     * - Near-bottom resumes auto-scroll and hides the pill
      * - Uses instant scroll during streaming (no smooth queue buildup)
      * - MutationObserver reacts to actual DOM changes, not React state
+     * - Exposes isScrolledAway() so the stream-end logic can show a pill
+     *   instead of jerking the user to the bottom
      */
     function createAutoScroller(container) {
       let shouldAutoScroll = true;
+      let _isScrolledAway = false;
+      const pill = document.getElementById("scroll-to-bottom-btn");
+
+      function showPill() {
+        if (!_isScrolledAway) {
+          _isScrolledAway = true;
+          pill.classList.add("visible");
+        }
+      }
+
+      function hidePill() {
+        if (_isScrolledAway) {
+          _isScrolledAway = false;
+          pill.classList.remove("visible");
+        }
+      }
+
+      // Clicking the pill smoothly scrolls to bottom
+      pill.addEventListener("click", () => {
+        container.scrollTo({ top: container.scrollHeight, behavior: "smooth" });
+        shouldAutoScroll = true;
+        hidePill();
+      });
 
       // Detect user scrolling UP via wheel event (not scroll event)
       container.addEventListener("wheel", (e) => {
         if (e.deltaY < 0) {
           // Scrolling up → user wants to read, pause auto-scroll
           shouldAutoScroll = false;
+          showPill();
         } else {
           // Scrolling down → check if near bottom to resume
           const { scrollHeight, clientHeight, scrollTop } = container;
           if (scrollHeight - clientHeight - scrollTop < 150) {
             shouldAutoScroll = true;
+            hidePill();
           }
         }
       }, { passive: true });
@@ -937,14 +1010,26 @@
       container.addEventListener("touchmove", (e) => {
         const deltaY = touchStartY - e.touches[0].clientY;
         if (deltaY < -10) {
-          shouldAutoScroll = false; // swiping down (scrolling up)
+          shouldAutoScroll = false;
+          showPill();
         } else if (deltaY > 10) {
           const { scrollHeight, clientHeight, scrollTop } = container;
           if (scrollHeight - clientHeight - scrollTop < 150) {
             shouldAutoScroll = true;
+            hidePill();
           }
         }
         touchStartY = e.touches[0].clientY;
+      }, { passive: true });
+
+      // Also detect scroll events to catch programmatic or inertial scrolling
+      // that lands the user near the bottom
+      container.addEventListener("scroll", () => {
+        const { scrollHeight, clientHeight, scrollTop } = container;
+        if (scrollHeight - clientHeight - scrollTop < 150) {
+          shouldAutoScroll = true;
+          hidePill();
+        }
       }, { passive: true });
 
       // MutationObserver: scroll on actual DOM changes
@@ -957,6 +1042,7 @@
 
       function start() {
         shouldAutoScroll = true;
+        hidePill();
         observer.observe(container, {
           childList: true,
           subtree: true,
@@ -966,17 +1052,27 @@
 
       function stop() {
         observer.disconnect();
-        // One final smooth scroll to land at the bottom
-        requestAnimationFrame(() => {
-          container.scrollTo({ top: container.scrollHeight, behavior: "smooth" });
-        });
+        if (shouldAutoScroll) {
+          // User was following along → gentle smooth scroll to final position
+          requestAnimationFrame(() => {
+            container.scrollTo({ top: container.scrollHeight, behavior: "smooth" });
+          });
+        } else {
+          // User scrolled away → show the pill, don't force-scroll
+          showPill();
+        }
       }
 
       function reset() {
         shouldAutoScroll = true;
+        hidePill();
       }
 
-      return { start, stop, reset };
+      function isScrolledAway() {
+        return _isScrolledAway;
+      }
+
+      return { start, stop, reset, isScrolledAway };
     }
 
     // Create the auto-scroller instance
