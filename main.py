@@ -6,6 +6,8 @@ import httpx
 import os
 import json
 import asyncio
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -15,16 +17,34 @@ app = FastAPI()
 DO_AGENT_URL = os.getenv("DO_AGENT_URL")
 DO_API_KEY = os.getenv("DO_API_KEY")
 
+
+def get_time_context() -> str:
+    """Generate a current date/time context string in Pacific Time."""
+    now = datetime.now(ZoneInfo("America/Los_Angeles"))
+    day_name = now.strftime("%A")
+    date_str = now.strftime("%B %d, %Y")
+    time_str = now.strftime("%I:%M %p %Z")
+    return (
+        f"Current date and time: {day_name}, {date_str}, {time_str}. "
+        "Use this to answer any questions about schedules, due dates, "
+        "or time-sensitive course information."
+    )
+
+
 class ChatRequest(BaseModel):
     message: str
     conversation_history: list = []
+
 
 @app.post("/api/chat")
 async def chat(request: ChatRequest):
     if not DO_AGENT_URL or not DO_API_KEY:
         raise HTTPException(status_code=500, detail="Agent not configured")
 
-    messages = request.conversation_history + [
+    # Inject current date/time as a system message at the front
+    time_context = {"role": "system", "content": get_time_context()}
+
+    messages = [time_context] + request.conversation_history + [
         {"role": "user", "content": request.message}
     ]
 
@@ -70,5 +90,6 @@ async def chat(request: ChatRequest):
             "Connection": "keep-alive",
         },
     )
+
 
 app.mount("/", StaticFiles(directory="static", html=True), name="static")

@@ -5,6 +5,7 @@ A web-based chat interface for the PoliCita political science teaching assistant
 ## Features
 
 - **Butter-smooth streaming** — tokens are buffered and rendered via `requestAnimationFrame` with adaptive pacing (80–600 CPS), producing a silky typewriter effect that masks network jitter
+- **Automatic date/time awareness** — the backend injects the current date, time, and day of the week (Pacific Time) into every request so the agent can answer questions about schedules and due dates accurately
 - **Blinking cursor** — inline `▋` cursor follows the text during streaming, disappears on completion
 - **Stop generation** — abort button cancels the response mid-stream via `AbortController`; partial response is preserved
 - **Deferred markdown rendering** — plain text during streaming (O(1) per frame), single full `marked.parse()` on completion (avoids O(n²) re-parsing)
@@ -36,6 +37,7 @@ polly-app/
 ### Prerequisites
 - Python 3.10+
 - A DigitalOcean Gradient AI agent endpoint and API key
+- Course documents uploaded to the agent's Knowledge Base (see below)
 
 ### Installation
 
@@ -65,13 +67,45 @@ uvicorn main:app --reload
 
 Open [http://localhost:8000](http://localhost:8000) in your browser.
 
+### Setting Up Course Documents (Knowledge Base)
+
+1. Log in to the DigitalOcean console
+2. Navigate to your Gradient AI agent's settings
+3. Under **Knowledge Base**, click **Add Knowledge Base**
+4. Upload your course documents (syllabus PDF, assignment sheets, reading lists, etc.)
+5. The platform handles chunking, embedding, and indexing automatically
+6. Update the agent's system instructions to reference the knowledge base for course-specific questions
+
 ## Architecture
 
 The frontend is a single `index.html` file with no build step. It streams Server-Sent Events from the FastAPI backend, which proxies requests to the DigitalOcean agent's `/api/v1/chat/completions` endpoint using `httpx`.
 
+```
+Student Browser → Nginx → FastAPI (main.py)
+                              │
+                              ├── Injects current date/time (Pacific Time)
+                              ├── Forwards to Gradient Agent endpoint
+                              │
+                              ▼
+                    DigitalOcean Gradient Agent
+                         ├── System prompt (PoliCita persona)
+                         ├── Knowledge Base (syllabus, course docs)
+                         └── LLM model (response generation)
+```
+
 **Key libraries:**
 - **Backend:** FastAPI, httpx, python-dotenv
 - **Frontend:** marked.js (CDN), DM Sans + Fraunces + JetBrains Mono (Google Fonts)
+
+### How Date/Time Injection Works
+
+Every request from the frontend passes through `main.py` before reaching the Gradient agent. The backend prepends a system message containing the current date, time, and day of the week in Pacific Time. This means the agent always knows "today" without needing function calling or external APIs. Example injected message:
+
+```
+Current date and time: Friday, February 21, 2026, 03:45 PM PST.
+Use this to answer any questions about schedules, due dates,
+or time-sensitive course information.
+```
 
 ### Streaming Pipeline
 
