@@ -57,5 +57,5 @@ jobs:
           # runs the deploy logic that ships with the code being deployed.
           ssh -i ~/.ssh/deploy_key -o IdentitiesOnly=yes \
               "$DROPLET_USER@$DROPLET_HOST" \
-              "APP_DIR='${APP_DIR}' SERVICE_NAME='${SERVICE_NAME}' BRANCH='${GITHUB_REF_NAME}' bash -s" \
+              "APP_DIR='${APP_DIR}' SERVICE_NAME='${SERVICE_NAME}' BRANCH='${GITHUB_REF_NAME}' DEPLOY_SHA='${GITHUB_SHA}' bash -s" \
               < scripts/deploy.sh

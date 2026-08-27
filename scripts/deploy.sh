@@ -11,6 +11,10 @@ set -euo pipefail
 APP_DIR="${APP_DIR:-/opt/policita}"
 SERVICE_NAME="${SERVICE_NAME:-policita}"
 BRANCH="${BRANCH:-master}"
+# The exact commit to deploy. The workflow passes the SHA that triggered it, so
+# a run always deploys the code its own deploy.sh came from; left empty (a
+# hand-run deploy) this falls back to whatever the branch currently points at.
+DEPLOY_SHA="${DEPLOY_SHA:-}"
 HEALTH_URL="${HEALTH_URL:-http://127.0.0.1:8000/api/health}"
 HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-45}"
 
@@ -50,6 +54,19 @@ wait_for_health() {
     return 1
 }
 
+# Restores the commit that was deployed before this run and brings the service
+# back up on it. Every failure after the worktree has moved routes through here.
+rollback() {
+    echo "$1" >&2
+    echo "Rolling back to ${PREVIOUS:0:7}." >&2
+    git reset --hard --quiet "$PREVIOUS"
+    install_deps || echo "Dependency install failed while rolling back — check the venv by hand." >&2
+    sudo systemctl restart "$SERVICE_NAME" || true
+    echo "Recent logs:" >&2
+    sudo journalctl -u "$SERVICE_NAME" -n 40 --no-pager >&2 || true
+    exit 1
+}
+
 cd "$APP_DIR"
 
 PREVIOUS=$(git rev-parse HEAD)
@@ -57,9 +74,16 @@ log "Deploying $BRANCH to $APP_DIR (currently at ${PREVIOUS:0:7})"
 
 log "Fetching"
 git fetch --quiet origin "$BRANCH"
+
+if [ -n "$DEPLOY_SHA" ] && ! git cat-file -e "${DEPLOY_SHA}^{commit}" 2>/dev/null; then
+    echo "Commit $DEPLOY_SHA is not present after fetching $BRANCH — refusing to deploy." >&2
+    exit 1
+fi
+
 # Reset rather than pull: the droplet is a deployment target, not a workspace,
 # and a stray local edit should never turn a deploy into a merge conflict.
-git reset --hard --quiet "origin/$BRANCH"
+# Nothing has moved yet if this fails, so there is nothing to roll back.
+git reset --hard --quiet "${DEPLOY_SHA:-origin/$BRANCH}"
 TARGET=$(git rev-parse HEAD)
 
 if [ "$TARGET" = "$PREVIOUS" ]; then
@@ -67,22 +91,13 @@ if [ "$TARGET" = "$PREVIOUS" ]; then
 fi
 
 log "Installing dependencies"
-install_deps
+install_deps || rollback "Dependency installation failed."
 
 log "Restarting $SERVICE_NAME"
-sudo systemctl restart "$SERVICE_NAME"
+sudo systemctl restart "$SERVICE_NAME" || rollback "The service did not restart."
 
 log "Waiting for health check"
-if ! REPORT=$(wait_for_health); then
-    echo "The app did not answer $HEALTH_URL within ${HEALTH_TIMEOUT}s." >&2
-    echo "Rolling back to ${PREVIOUS:0:7}." >&2
-    git reset --hard --quiet "$PREVIOUS"
-    install_deps || true
-    sudo systemctl restart "$SERVICE_NAME"
-    echo "Rolled back. Recent logs:" >&2
-    sudo journalctl -u "$SERVICE_NAME" -n 40 --no-pager >&2 || true
-    exit 1
-fi
+REPORT=$(wait_for_health) || rollback "The app did not answer $HEALTH_URL within ${HEALTH_TIMEOUT}s."
 
 echo "$REPORT"
 
