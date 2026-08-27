@@ -1,0 +1,38 @@
+# The unit the droplet actually runs, kept here so it is version controlled and
+# can be restored if the droplet is ever rebuilt.
+#
+#   sudo cp deploy/polly-chat.service /etc/systemd/system/polly-chat.service
+#   sudo systemctl daemon-reload
+#   sudo systemctl restart polly-chat
+#
+# This matches the live unit except for the network ordering noted below. If you
+# reinstall it, nothing else about the service changes.
+
+[Unit]
+Description=Polly Chat FastAPI App
+# network-online.target rather than network.target: the latter is reached before
+# an address is actually configured, so a boot-time start can come up without
+# working DNS and fail its first calls to the agent.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=root
+
+# WorkingDirectory is what lets load_dotenv() find .env at all; EnvironmentFile
+# makes systemd read the same file, so the process still gets its config if the
+# working directory ever changes. Note that systemd wins: load_dotenv() does not
+# override variables that are already set, so systemd's parse of .env is the one
+# the app sees.
+WorkingDirectory=/opt/polly-chat
+EnvironmentFile=/opt/polly-chat/.env
+
+ExecStart=/opt/polly-chat/venv/bin/uvicorn main:app --host 127.0.0.1 --port 8000
+
+# Restart=always keeps a crash-looping app "successfully restarted" as far as
+# systemctl is concerned, which is why scripts/deploy.sh verifies the deploy
+# against /api/health instead of trusting the restart's exit code.
+Restart=always
+
+[Install]
+WantedBy=multi-user.target

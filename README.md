@@ -24,12 +24,17 @@ A web-based chat interface for the PoliCita political science teaching assistant
 
 ```
 polly-app/
-├── main.py              # FastAPI backend — proxies SSE stream to/from DO agent
+├── main.py                      # FastAPI backend — proxies SSE stream to/from DO agent
 ├── static/
-│   └── index.html       # Single-file frontend (HTML + CSS + JS)
-├── requirements.txt     # Python dependencies
+│   └── index.html               # Single-file frontend (HTML + CSS + JS)
+├── scripts/
+│   └── deploy.sh                # Pull, install, restart, health-check, roll back on failure
+├── deploy/
+│   └── polly-chat.service       # The droplet's systemd unit, version controlled
+├── .github/workflows/deploy.yml # Deploys to the droplet on every push to master
+├── requirements.txt             # Python dependencies
 ├── .gitignore
-└── .env                 # DO_AGENT_URL and DO_API_KEY (not committed)
+└── .env                         # DO_AGENT_URL and DO_API_KEY (not committed)
 ```
 
 ## Setup
@@ -172,6 +177,153 @@ on `DO_AGENT_URL` is ignored. A key pasted into a control panel or an
 `EnvironmentFile` frequently picks up a trailing newline, which otherwise
 produces a malformed `Authorization` header and a 401 from the agent.
 
+## Deployment
+
+Pushing to `master` deploys to the droplet. The workflow in
+`.github/workflows/deploy.yml` opens an SSH session and pipes `scripts/deploy.sh`
+to it, so the droplet always runs the deploy logic from the commit being
+deployed. That script fetches, installs dependencies, restarts the service, and
+then **verifies the result against `/api/health`** — if the app does not answer,
+it rolls back to the previous commit, restarts, and fails the build with the
+last 40 lines of the service log.
+
+A deploy that leaves the app running but unable to reach the agent is reported
+loudly and *not* rolled back: that is a configuration problem, and the previous
+commit would fail the same way while hiding the report that identifies it.
+
+### One-time setup
+
+**1. Find out how the app currently runs.** On the droplet:
+
+```bash
+PORT=8000
+PID=$(sudo ss -lptnH "sport = :$PORT" | grep -oP 'pid=\K[0-9]+' | head -1)
+if [ -z "$PID" ]; then
+  echo "nothing listening on :$PORT"
+else
+  echo "pid:     $PID"
+  echo "command: $(tr '\0' ' ' < /proc/$PID/cmdline)"
+  echo "cwd:     $(sudo readlink /proc/$PID/cwd)"
+  UNIT=$(ps -o unit= -p "$PID" 2>/dev/null | tr -d ' ')
+  case "$UNIT" in
+    ""|-|*.scope) echo "unit:    none — started by hand, will not survive a reboot" ;;
+    *)            echo "unit:    $UNIT"; sudo systemctl cat "$UNIT" ;;
+  esac
+fi
+```
+
+`cwd` is the working directory the process actually has, and the unit file shows
+whether `WorkingDirectory` and `EnvironmentFile` are set. If `unit` comes back
+empty the app was started by hand and will not survive a reboot — install
+`deploy/polly-chat.service` (adjusting the user and paths first) before going
+further.
+
+**2. Give the droplet read access to this repo.** The deploy fetches from
+GitHub, and the droplet's remote is HTTPS, which GitHub no longer accepts a
+password for — so a fetch there prompts for credentials and fails. This is
+easy to miss because it fails silently in one specific way: `git fetch` errors,
+but the `git reset --hard origin/master` that follows still succeeds against the
+*stale* local `origin/master` ref, so the deploy reports success while changing
+nothing.
+
+Generate a key on the droplet:
+
+```bash
+ssh-keygen -t ed25519 -C "polly-chat droplet" -f /root/.ssh/github_deploy -N ""
+cat /root/.ssh/github_deploy.pub
+```
+
+Add that public key at **Settings → Deploy keys → Add deploy key** on this
+repository. Leave *Allow write access* unchecked; deploys only read.
+
+Then point SSH and the remote at it:
+
+```bash
+printf 'Host github.com\n  IdentityFile /root/.ssh/github_deploy\n  IdentitiesOnly yes\n' >> /root/.ssh/config
+chmod 600 /root/.ssh/config
+git -C /opt/polly-chat remote set-url origin git@github.com:Abe-Borg/polly-chat.git
+ssh -T git@github.com
+```
+
+The last command should answer `Hi Abe-Borg/polly-chat! You've successfully
+authenticated, but GitHub does not provide shell access.` Confirm the fetch
+itself works before relying on any of this:
+
+```bash
+git -C /opt/polly-chat fetch origin master && echo "fetch OK"
+```
+
+**3. Create a deploy key for GitHub Actions to reach the droplet.** This is a
+second, separate key, in the opposite direction: step 2 lets the droplet read
+from GitHub, this one lets GitHub Actions log in to the droplet. On your
+machine:
+
+```bash
+ssh-keygen -t ed25519 -C "github-actions-deploy" -f ~/.ssh/polly_deploy -N ""
+ssh-copy-id -i ~/.ssh/polly_deploy.pub root@your.droplet.ip
+```
+
+**4. If you deploy as a non-root user, let it restart the service without a
+password.** Skip this entirely when the SSH user is `root`. Otherwise, on the
+droplet with `sudo visudo -f /etc/sudoers.d/polly-chat-deploy` (confirm the
+paths with `command -v systemctl journalctl`):
+
+```
+youruser ALL=(root) NOPASSWD: /usr/bin/systemctl restart polly-chat, /usr/bin/journalctl -u polly-chat *
+```
+
+**5. Add the repository secrets and variables** under Settings → Secrets and
+variables → Actions:
+
+| Kind     | Name               | Value                                            |
+|----------|--------------------|--------------------------------------------------|
+| Secret   | `DROPLET_SSH_KEY`  | Contents of `~/.ssh/polly_deploy` (private key)   |
+| Secret   | `DROPLET_HOST`     | Droplet IP or hostname                           |
+| Secret   | `DROPLET_USER`     | SSH user — `root` on the current droplet         |
+| Variable | `APP_DIR`          | `/opt/polly-chat`                                |
+| Variable | `SERVICE_NAME`     | `polly-chat`                                     |
+
+`APP_DIR` and `SERVICE_NAME` match the defaults baked into `scripts/deploy.sh`,
+so they are only strictly needed if the droplet ever changes.
+
+**6. Confirm the droplet's checkout tracks this repo** — the script deploys with
+`git fetch` and `git reset --hard`, so the app directory has to be a clone with
+an `origin` remote:
+
+```bash
+git -C /opt/polly-chat remote -v
+```
+
+If that reports no remote, the code was copied up rather than cloned. Turn it
+into a clone before the first deploy — `.env` is untracked and survives:
+
+```bash
+cd /opt/polly-chat
+git init -b master
+git remote add origin https://github.com/Abe-Borg/polly-chat.git
+git fetch origin master
+git reset --hard origin/master
+```
+
+Then run the workflow once from the Actions tab (**Deploy to droplet** → Run
+workflow) to prove the path end to end before relying on it.
+
+### Deploying by hand
+
+The same script runs standalone on the droplet, which is useful when you want a
+deploy without a push:
+
+```bash
+cd /opt/polly-chat && bash scripts/deploy.sh
+```
+
+### Why `reset --hard` and not `pull`
+
+The droplet is a deployment target, not a workspace. A stray edit made while
+debugging would turn the next `git pull` into a merge conflict at the worst
+possible moment; resetting to `origin/master` makes the deploy deterministic.
+`.env` is gitignored, so it is never touched.
+
 ## Troubleshooting
 
 ### `/api/health`
@@ -221,6 +373,40 @@ rendered in the transcript, and the full upstream body is logged server-side
 response that is empty with no error at all points at the connection being cut
 between the browser and the app rather than at the agent — check the Nginx
 config below.
+
+### When systemd supplies the environment
+
+The unit sets both `WorkingDirectory` and `EnvironmentFile`, so `.env` is read
+twice: once by systemd, once by `load_dotenv()`. **systemd wins.** `load_dotenv()`
+defaults to `override=False` and will not replace a variable that is already
+set, so the value the app sees is systemd's parse of the file, not dotenv's.
+
+The two parsers do not agree on everything, and the difference bites when `.env`
+was written on Windows. A CRLF file gives systemd a trailing carriage return in
+the value, producing an `Authorization: Bearer <key>\r` header and a 401 from a
+key that is otherwise perfectly valid. Check without printing the key:
+
+```bash
+sudo grep -c $'\r' /opt/polly-chat/.env    # any non-zero result is this bug
+```
+
+Fix it in place, then restart:
+
+```bash
+sudo sed -i 's/\r$//' /opt/polly-chat/.env
+sudo systemctl restart polly-chat
+```
+
+The backend strips surrounding whitespace from both values on load, so this is
+handled either way, and `/api/health` reports
+`api_key_had_surrounding_whitespace: true` when it had to.
+
+To confirm what the running process actually received, without exposing it:
+
+```bash
+sudo tr '\0' '\n' < /proc/$(systemctl show -p MainPID --value polly-chat)/environ \
+  | grep -E '^DO_' | sed 's/=.*/=<set>/'
+```
 
 ### Compatibility with agents that reject a system role
 

@@ -1,0 +1,61 @@
+name: Deploy to droplet
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+# Never let two deploys touch the droplet at once, and never cancel one
+# midway — a half-applied deploy is worse than a queued one.
+concurrency:
+  group: deploy-droplet
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Merging this workflow before the secrets exist would otherwise fail with
+      # an opaque SSH error. Report what is missing and skip instead.
+      - name: Check deploy configuration
+        id: preflight
+        env:
+          DROPLET_HOST: ${{ secrets.DROPLET_HOST }}
+          DROPLET_USER: ${{ secrets.DROPLET_USER }}
+          SSH_KEY: ${{ secrets.DROPLET_SSH_KEY }}
+        run: |
+          missing=""
+          [ -z "$DROPLET_HOST" ] && missing="$missing DROPLET_HOST"
+          [ -z "$DROPLET_USER" ] && missing="$missing DROPLET_USER"
+          [ -z "$SSH_KEY" ] && missing="$missing DROPLET_SSH_KEY"
+          if [ -n "$missing" ]; then
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::Skipping deploy — missing secrets:$missing. See README → Deployment → One-time setup."
+          else
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Deploy over SSH
+        if: steps.preflight.outputs.configured == 'true'
+        env:
+          SSH_KEY: ${{ secrets.DROPLET_SSH_KEY }}
+          DROPLET_HOST: ${{ secrets.DROPLET_HOST }}
+          DROPLET_USER: ${{ secrets.DROPLET_USER }}
+          APP_DIR: ${{ vars.APP_DIR }}
+          SERVICE_NAME: ${{ vars.SERVICE_NAME }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H "$DROPLET_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+
+          # scripts/deploy.sh is piped from this commit, so the droplet always
+          # runs the deploy logic that ships with the code being deployed.
+          ssh -i ~/.ssh/deploy_key -o IdentitiesOnly=yes \
+              "$DROPLET_USER@$DROPLET_HOST" \
+              "APP_DIR='${APP_DIR}' SERVICE_NAME='${SERVICE_NAME}' BRANCH='${GITHUB_REF_NAME}' DEPLOY_SHA='${GITHUB_SHA}' bash -s" \
+              < scripts/deploy.sh
