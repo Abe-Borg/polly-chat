@@ -144,7 +144,7 @@ The FastAPI backend includes headers to ensure streaming works end-to-end in pro
 - `X-Accel-Buffering: no` — prevents Nginx from buffering the SSE stream into large blobs
 - `Cache-Control: no-cache, no-transform` — prevents intermediary caching
 - `Connection: keep-alive` — maintains the SSE connection
-- Periodic `: keep-alive` SSE comment lines (every 15s) to survive intermediary idle timeouts
+- Periodic `: keep-alive` SSE comment lines (every 15s of upstream silence) to survive intermediary idle timeouts. Agent output is pulled by a background task so that idle time is genuinely idle for the request handler — iterating the upstream response directly would block the handler and starve the keep-alive exactly when it is needed, letting Nginx's default 60s `proxy_read_timeout` drop a slow answer
 
 ### Nginx Configuration
 
@@ -166,3 +166,66 @@ location /api/ {
 |----------------|--------------------------------------------------|
 | `DO_AGENT_URL` | Base URL of your DigitalOcean Gradient AI agent  |
 | `DO_API_KEY`   | API key for authenticating with the agent         |
+
+Both values are trimmed of surrounding whitespace on load, and a trailing slash
+on `DO_AGENT_URL` is ignored. A key pasted into a control panel or an
+`EnvironmentFile` frequently picks up a trailing newline, which otherwise
+produces a malformed `Authorization` header and a 401 from the agent.
+
+## Troubleshooting
+
+### `/api/health`
+
+Deployments fail differently than local runs, usually because the process never
+received the environment. `GET /api/health` reports what the running process
+actually loaded, and reveals no secret material, so it is safe to curl against
+a live deployment:
+
+```bash
+curl -s https://your-host/api/health | python -m json.tool
+```
+
+```json
+{
+  "agent_url_configured": true,
+  "agent_url": "https://your-agent.ondigitalocean.app",
+  "api_key_configured": true,
+  "api_key": { "length": 64, "sha256_prefix": "9b5192e64b0d" },
+  "api_key_had_surrounding_whitespace": false,
+  "agent_reachable": true,
+  "agent_status_code": 200
+}
+```
+
+Read it as follows:
+
+- **`api_key_configured: false`** — the process never loaded `.env`. Under
+  systemd this is almost always a missing `WorkingDirectory` or
+  `EnvironmentFile`; `load_dotenv()` only finds `.env` relative to the working
+  directory.
+- **`api_key_had_surrounding_whitespace: true`** — the key is being sent with a
+  stray newline or space. It is now trimmed automatically, but the source value
+  is worth cleaning up.
+- **`api_key.sha256_prefix`** — confirm the deployment holds the key you think
+  it does, without exposing it, by comparing against your own copy:
+  `printf %s "$DO_API_KEY" | sha256sum | cut -c1-12`
+- **`agent_reachable: false`** — the process cannot reach the agent.
+  `agent_detail` carries the status code and response body; a 401 means the key
+  is wrong or expired, and a connection error usually means egress is blocked.
+
+### The chat returns nothing
+
+Upstream failures are delivered to the browser as an SSE error frame and
+rendered in the transcript, and the full upstream body is logged server-side
+(`journalctl -u your-service -f`) and written to the browser console. A
+response that is empty with no error at all points at the connection being cut
+between the browser and the app rather than at the agent — check the Nginx
+config below.
+
+### Compatibility with agents that reject a system role
+
+The date/time context is sent as a leading `system` message. Agents configured
+with their own platform-side system prompt may reject a client-supplied one
+with a 400. When that happens the backend automatically retries the request
+once with the same context folded into the user turn, so time awareness keeps
+working either way.
