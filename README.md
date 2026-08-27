@@ -30,7 +30,7 @@ polly-app/
 ├── scripts/
 │   └── deploy.sh                # Pull, install, restart, health-check, roll back on failure
 ├── deploy/
-│   └── policita.service         # Template systemd unit for the droplet
+│   └── polly-chat.service       # The droplet's systemd unit, version controlled
 ├── .github/workflows/deploy.yml # Deploys to the droplet on every push to master
 ├── requirements.txt             # Python dependencies
 ├── .gitignore
@@ -215,38 +215,57 @@ fi
 `cwd` is the working directory the process actually has, and the unit file shows
 whether `WorkingDirectory` and `EnvironmentFile` are set. If `unit` comes back
 empty the app was started by hand and will not survive a reboot — install
-`deploy/policita.service` (adjusting the user and paths first) before going
+`deploy/polly-chat.service` (adjusting the user and paths first) before going
 further.
 
 **2. Create a deploy key.** On your machine:
 
 ```bash
-ssh-keygen -t ed25519 -C "github-actions-deploy" -f ~/.ssh/policita_deploy -N ""
-ssh-copy-id -i ~/.ssh/policita_deploy.pub youruser@your.droplet.ip
+ssh-keygen -t ed25519 -C "github-actions-deploy" -f ~/.ssh/polly_deploy -N ""
+ssh-copy-id -i ~/.ssh/polly_deploy.pub root@your.droplet.ip
 ```
 
-**3. Let the deploy user restart the service without a password.** On the
-droplet, with `sudo visudo -f /etc/sudoers.d/policita-deploy` (check your paths
-with `command -v systemctl journalctl`):
+**3. If you deploy as a non-root user, let it restart the service without a
+password.** Skip this entirely when the SSH user is `root`. Otherwise, on the
+droplet with `sudo visudo -f /etc/sudoers.d/polly-chat-deploy` (confirm the
+paths with `command -v systemctl journalctl`):
 
 ```
-youruser ALL=(root) NOPASSWD: /usr/bin/systemctl restart policita, /usr/bin/journalctl -u policita *
+youruser ALL=(root) NOPASSWD: /usr/bin/systemctl restart polly-chat, /usr/bin/journalctl -u polly-chat *
 ```
 
 **4. Add the repository secrets and variables** under Settings → Secrets and
 variables → Actions:
 
-| Kind     | Name               | Value                                        |
-|----------|--------------------|----------------------------------------------|
-| Secret   | `DROPLET_SSH_KEY`  | Contents of `~/.ssh/policita_deploy` (private key) |
-| Secret   | `DROPLET_HOST`     | Droplet IP or hostname                       |
-| Secret   | `DROPLET_USER`     | SSH user, e.g. `root` or `deploy`            |
-| Variable | `APP_DIR`          | Path to the checkout, e.g. `/opt/policita`   |
-| Variable | `SERVICE_NAME`     | systemd unit name, e.g. `policita`           |
+| Kind     | Name               | Value                                            |
+|----------|--------------------|--------------------------------------------------|
+| Secret   | `DROPLET_SSH_KEY`  | Contents of `~/.ssh/polly_deploy` (private key)   |
+| Secret   | `DROPLET_HOST`     | Droplet IP or hostname                           |
+| Secret   | `DROPLET_USER`     | SSH user — `root` on the current droplet         |
+| Variable | `APP_DIR`          | `/opt/polly-chat`                                |
+| Variable | `SERVICE_NAME`     | `polly-chat`                                     |
+
+`APP_DIR` and `SERVICE_NAME` match the defaults baked into `scripts/deploy.sh`,
+so they are only strictly needed if the droplet ever changes.
 
 **5. Confirm the droplet's checkout tracks this repo** — the script deploys with
-`git fetch` and `git reset --hard origin/master`, so the app directory has to be
-a clone with an `origin` remote. Verify with `git -C /opt/policita remote -v`.
+`git fetch` and `git reset --hard`, so the app directory has to be a clone with
+an `origin` remote:
+
+```bash
+git -C /opt/polly-chat remote -v
+```
+
+If that reports no remote, the code was copied up rather than cloned. Turn it
+into a clone before the first deploy — `.env` is untracked and survives:
+
+```bash
+cd /opt/polly-chat
+git init -b master
+git remote add origin https://github.com/Abe-Borg/polly-chat.git
+git fetch origin master
+git reset --hard origin/master
+```
 
 Then run the workflow once from the Actions tab (**Deploy to droplet** → Run
 workflow) to prove the path end to end before relying on it.
@@ -257,7 +276,7 @@ The same script runs standalone on the droplet, which is useful when you want a
 deploy without a push:
 
 ```bash
-cd /opt/policita && APP_DIR=/opt/policita SERVICE_NAME=policita bash scripts/deploy.sh
+cd /opt/polly-chat && bash scripts/deploy.sh
 ```
 
 ### Why `reset --hard` and not `pull`
@@ -316,6 +335,40 @@ rendered in the transcript, and the full upstream body is logged server-side
 response that is empty with no error at all points at the connection being cut
 between the browser and the app rather than at the agent — check the Nginx
 config below.
+
+### When systemd supplies the environment
+
+The unit sets both `WorkingDirectory` and `EnvironmentFile`, so `.env` is read
+twice: once by systemd, once by `load_dotenv()`. **systemd wins.** `load_dotenv()`
+defaults to `override=False` and will not replace a variable that is already
+set, so the value the app sees is systemd's parse of the file, not dotenv's.
+
+The two parsers do not agree on everything, and the difference bites when `.env`
+was written on Windows. A CRLF file gives systemd a trailing carriage return in
+the value, producing an `Authorization: Bearer <key>\r` header and a 401 from a
+key that is otherwise perfectly valid. Check without printing the key:
+
+```bash
+sudo grep -c $'\r' /opt/polly-chat/.env    # any non-zero result is this bug
+```
+
+Fix it in place, then restart:
+
+```bash
+sudo sed -i 's/\r$//' /opt/polly-chat/.env
+sudo systemctl restart polly-chat
+```
+
+The backend strips surrounding whitespace from both values on load, so this is
+handled either way, and `/api/health` reports
+`api_key_had_surrounding_whitespace: true` when it had to.
+
+To confirm what the running process actually received, without exposing it:
+
+```bash
+sudo tr '\0' '\n' < /proc/$(systemctl show -p MainPID --value polly-chat)/environ \
+  | grep -E '^DO_' | sed 's/=.*/=<set>/'
+```
 
 ### Compatibility with agents that reject a system role
 

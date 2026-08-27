@@ -8,8 +8,8 @@
 # Override any of the settings below by exporting them first.
 set -euo pipefail
 
-APP_DIR="${APP_DIR:-/opt/policita}"
-SERVICE_NAME="${SERVICE_NAME:-policita}"
+APP_DIR="${APP_DIR:-/opt/polly-chat}"
+SERVICE_NAME="${SERVICE_NAME:-polly-chat}"
 BRANCH="${BRANCH:-master}"
 # The exact commit to deploy. The workflow passes the SHA that triggered it, so
 # a run always deploys the code its own deploy.sh came from; left empty (a
