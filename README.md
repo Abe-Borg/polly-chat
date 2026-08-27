@@ -218,14 +218,52 @@ empty the app was started by hand and will not survive a reboot — install
 `deploy/polly-chat.service` (adjusting the user and paths first) before going
 further.
 
-**2. Create a deploy key.** On your machine:
+**2. Give the droplet read access to this repo.** The deploy fetches from
+GitHub, and the droplet's remote is HTTPS, which GitHub no longer accepts a
+password for — so a fetch there prompts for credentials and fails. This is
+easy to miss because it fails silently in one specific way: `git fetch` errors,
+but the `git reset --hard origin/master` that follows still succeeds against the
+*stale* local `origin/master` ref, so the deploy reports success while changing
+nothing.
+
+Generate a key on the droplet:
+
+```bash
+ssh-keygen -t ed25519 -C "polly-chat droplet" -f /root/.ssh/github_deploy -N ""
+cat /root/.ssh/github_deploy.pub
+```
+
+Add that public key at **Settings → Deploy keys → Add deploy key** on this
+repository. Leave *Allow write access* unchecked; deploys only read.
+
+Then point SSH and the remote at it:
+
+```bash
+printf 'Host github.com\n  IdentityFile /root/.ssh/github_deploy\n  IdentitiesOnly yes\n' >> /root/.ssh/config
+chmod 600 /root/.ssh/config
+git -C /opt/polly-chat remote set-url origin git@github.com:Abe-Borg/polly-chat.git
+ssh -T git@github.com
+```
+
+The last command should answer `Hi Abe-Borg/polly-chat! You've successfully
+authenticated, but GitHub does not provide shell access.` Confirm the fetch
+itself works before relying on any of this:
+
+```bash
+git -C /opt/polly-chat fetch origin master && echo "fetch OK"
+```
+
+**3. Create a deploy key for GitHub Actions to reach the droplet.** This is a
+second, separate key, in the opposite direction: step 2 lets the droplet read
+from GitHub, this one lets GitHub Actions log in to the droplet. On your
+machine:
 
 ```bash
 ssh-keygen -t ed25519 -C "github-actions-deploy" -f ~/.ssh/polly_deploy -N ""
 ssh-copy-id -i ~/.ssh/polly_deploy.pub root@your.droplet.ip
 ```
 
-**3. If you deploy as a non-root user, let it restart the service without a
+**4. If you deploy as a non-root user, let it restart the service without a
 password.** Skip this entirely when the SSH user is `root`. Otherwise, on the
 droplet with `sudo visudo -f /etc/sudoers.d/polly-chat-deploy` (confirm the
 paths with `command -v systemctl journalctl`):
@@ -234,7 +272,7 @@ paths with `command -v systemctl journalctl`):
 youruser ALL=(root) NOPASSWD: /usr/bin/systemctl restart polly-chat, /usr/bin/journalctl -u polly-chat *
 ```
 
-**4. Add the repository secrets and variables** under Settings → Secrets and
+**5. Add the repository secrets and variables** under Settings → Secrets and
 variables → Actions:
 
 | Kind     | Name               | Value                                            |
@@ -248,7 +286,7 @@ variables → Actions:
 `APP_DIR` and `SERVICE_NAME` match the defaults baked into `scripts/deploy.sh`,
 so they are only strictly needed if the droplet ever changes.
 
-**5. Confirm the droplet's checkout tracks this repo** — the script deploys with
+**6. Confirm the droplet's checkout tracks this repo** — the script deploys with
 `git fetch` and `git reset --hard`, so the app directory has to be a clone with
 an `origin` remote:
 

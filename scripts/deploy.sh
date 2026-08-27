@@ -73,7 +73,16 @@ PREVIOUS=$(git rev-parse HEAD)
 log "Deploying $BRANCH to $APP_DIR (currently at ${PREVIOUS:0:7})"
 
 log "Fetching"
-git fetch --quiet origin "$BRANCH"
+# Nothing has moved yet if this fails, so exit rather than roll back. The usual
+# cause is the droplet lacking read access to the repository, which is worth
+# naming: the reset below would otherwise succeed against a stale origin ref and
+# report a successful deploy that changed nothing.
+if ! git fetch --quiet origin "$BRANCH"; then
+    echo "git fetch failed." >&2
+    echo "If that was an authentication error, the droplet needs read access to" >&2
+    echo "the repository — see README, Deployment, One-time setup." >&2
+    exit 1
+fi
 
 if [ -n "$DEPLOY_SHA" ] && ! git cat-file -e "${DEPLOY_SHA}^{commit}" 2>/dev/null; then
     echo "Commit $DEPLOY_SHA is not present after fetching $BRANCH — refusing to deploy." >&2
