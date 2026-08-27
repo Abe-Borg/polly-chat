@@ -1215,6 +1215,7 @@
       let streamRow = null;
       let pacer = null;
       let fullReply = "";
+      let streamError = null;
 
       try {
         const response = await fetch("/api/chat", {
@@ -1257,6 +1258,16 @@
 
             try {
               const parsed = JSON.parse(data);
+
+              // The backend reports upstream failures as an error frame.
+              // Without this the frame parses fine, yields no token, and the
+              // real reason for an empty answer never reaches the user.
+              if (parsed.error) {
+                streamError = parsed.error;
+                if (parsed.detail) console.error("Agent error:", parsed.detail);
+                continue;
+              }
+
               const token = parsed.choices?.[0]?.delta?.content;
               if (token) {
                 // First token: swap typing indicator for streaming row
@@ -1296,11 +1307,15 @@
 
         if (!streamRow) {
           typingDiv.remove();
-          addMessageRow("No response received.", "agent");
+          addMessageRow(streamError || "No response received.", "agent");
         }
 
-        conversationHistory.push({ role: "user", content: message });
-        conversationHistory.push({ role: "assistant", content: fullReply });
+        // An empty assistant turn would be replayed on every later request,
+        // so only record the exchange when the agent actually answered.
+        if (fullReply) {
+          conversationHistory.push({ role: "user", content: message });
+          conversationHistory.push({ role: "assistant", content: fullReply });
+        }
 
       } catch (err) {
         autoScroller.stop();
