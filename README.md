@@ -24,12 +24,17 @@ A web-based chat interface for the PoliCita political science teaching assistant
 
 ```
 polly-app/
-├── main.py              # FastAPI backend — proxies SSE stream to/from DO agent
+├── main.py                      # FastAPI backend — proxies SSE stream to/from DO agent
 ├── static/
-│   └── index.html       # Single-file frontend (HTML + CSS + JS)
-├── requirements.txt     # Python dependencies
+│   └── index.html               # Single-file frontend (HTML + CSS + JS)
+├── scripts/
+│   └── deploy.sh                # Pull, install, restart, health-check, roll back on failure
+├── deploy/
+│   └── policita.service         # Template systemd unit for the droplet
+├── .github/workflows/deploy.yml # Deploys to the droplet on every push to master
+├── requirements.txt             # Python dependencies
 ├── .gitignore
-└── .env                 # DO_AGENT_URL and DO_API_KEY (not committed)
+└── .env                         # DO_AGENT_URL and DO_API_KEY (not committed)
 ```
 
 ## Setup
@@ -171,6 +176,96 @@ Both values are trimmed of surrounding whitespace on load, and a trailing slash
 on `DO_AGENT_URL` is ignored. A key pasted into a control panel or an
 `EnvironmentFile` frequently picks up a trailing newline, which otherwise
 produces a malformed `Authorization` header and a 401 from the agent.
+
+## Deployment
+
+Pushing to `master` deploys to the droplet. The workflow in
+`.github/workflows/deploy.yml` opens an SSH session and pipes `scripts/deploy.sh`
+to it, so the droplet always runs the deploy logic from the commit being
+deployed. That script fetches, installs dependencies, restarts the service, and
+then **verifies the result against `/api/health`** — if the app does not answer,
+it rolls back to the previous commit, restarts, and fails the build with the
+last 40 lines of the service log.
+
+A deploy that leaves the app running but unable to reach the agent is reported
+loudly and *not* rolled back: that is a configuration problem, and the previous
+commit would fail the same way while hiding the report that identifies it.
+
+### One-time setup
+
+**1. Find out how the app currently runs.** On the droplet:
+
+```bash
+PORT=8000
+PID=$(sudo ss -lptnH "sport = :$PORT" | grep -oP 'pid=\K[0-9]+' | head -1)
+if [ -z "$PID" ]; then
+  echo "nothing listening on :$PORT"
+else
+  echo "pid:     $PID"
+  echo "command: $(tr '\0' ' ' < /proc/$PID/cmdline)"
+  echo "cwd:     $(sudo readlink /proc/$PID/cwd)"
+  UNIT=$(ps -o unit= -p "$PID" 2>/dev/null | tr -d ' ')
+  case "$UNIT" in
+    ""|-|*.scope) echo "unit:    none — started by hand, will not survive a reboot" ;;
+    *)            echo "unit:    $UNIT"; sudo systemctl cat "$UNIT" ;;
+  esac
+fi
+```
+
+`cwd` is the working directory the process actually has, and the unit file shows
+whether `WorkingDirectory` and `EnvironmentFile` are set. If `unit` comes back
+empty the app was started by hand and will not survive a reboot — install
+`deploy/policita.service` (adjusting the user and paths first) before going
+further.
+
+**2. Create a deploy key.** On your machine:
+
+```bash
+ssh-keygen -t ed25519 -C "github-actions-deploy" -f ~/.ssh/policita_deploy -N ""
+ssh-copy-id -i ~/.ssh/policita_deploy.pub youruser@your.droplet.ip
+```
+
+**3. Let the deploy user restart the service without a password.** On the
+droplet, with `sudo visudo -f /etc/sudoers.d/policita-deploy` (check your paths
+with `command -v systemctl journalctl`):
+
+```
+youruser ALL=(root) NOPASSWD: /usr/bin/systemctl restart policita, /usr/bin/journalctl -u policita *
+```
+
+**4. Add the repository secrets and variables** under Settings → Secrets and
+variables → Actions:
+
+| Kind     | Name               | Value                                        |
+|----------|--------------------|----------------------------------------------|
+| Secret   | `DROPLET_SSH_KEY`  | Contents of `~/.ssh/policita_deploy` (private key) |
+| Secret   | `DROPLET_HOST`     | Droplet IP or hostname                       |
+| Secret   | `DROPLET_USER`     | SSH user, e.g. `root` or `deploy`            |
+| Variable | `APP_DIR`          | Path to the checkout, e.g. `/opt/policita`   |
+| Variable | `SERVICE_NAME`     | systemd unit name, e.g. `policita`           |
+
+**5. Confirm the droplet's checkout tracks this repo** — the script deploys with
+`git fetch` and `git reset --hard origin/master`, so the app directory has to be
+a clone with an `origin` remote. Verify with `git -C /opt/policita remote -v`.
+
+Then run the workflow once from the Actions tab (**Deploy to droplet** → Run
+workflow) to prove the path end to end before relying on it.
+
+### Deploying by hand
+
+The same script runs standalone on the droplet, which is useful when you want a
+deploy without a push:
+
+```bash
+cd /opt/policita && APP_DIR=/opt/policita SERVICE_NAME=policita bash scripts/deploy.sh
+```
+
+### Why `reset --hard` and not `pull`
+
+The droplet is a deployment target, not a workspace. A stray edit made while
+debugging would turn the next `git pull` into a merge conflict at the worst
+possible moment; resetting to `origin/master` makes the deploy deterministic.
+`.env` is gitignored, so it is never touched.
 
 ## Troubleshooting
 
