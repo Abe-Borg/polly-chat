@@ -233,18 +233,25 @@ async def health():
 
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=15.0)) as client:
-            response = await client.post(
+            # Probe exactly the way /api/chat does, streaming included. An agent
+            # that enforces a timeout threshold on buffered replies rejects a
+            # non-streaming probe outright, which would report a perfectly
+            # healthy agent as unreachable. Only the response head is needed, so
+            # leaving the context closes the body without reading the answer.
+            async with client.stream(
+                "POST",
                 f"{DO_AGENT_URL}{AGENT_PATH}",
                 headers={
                     "Authorization": f"Bearer {DO_API_KEY}",
                     "Content-Type": "application/json",
                 },
-                json={"messages": [{"role": "user", "content": "ping"}], "stream": False},
-            )
-        report["agent_reachable"] = response.status_code == 200
-        report["agent_status_code"] = response.status_code
-        if response.status_code != 200:
-            report["agent_detail"] = response.text[:500]
+                json={"messages": [{"role": "user", "content": "ping"}], "stream": True},
+            ) as response:
+                report["agent_reachable"] = response.status_code == 200
+                report["agent_status_code"] = response.status_code
+                if response.status_code != 200:
+                    body = (await response.aread()).decode(errors="replace")
+                    report["agent_detail"] = body[:500]
     except httpx.HTTPError as exc:
         report["agent_reachable"] = False
         report["agent_detail"] = f"{type(exc).__name__}: {exc}"
