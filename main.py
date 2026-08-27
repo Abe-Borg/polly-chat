@@ -108,12 +108,21 @@ async def _agent_sse_frames(response):
             await queue.put(done)
 
     pump_task = asyncio.create_task(pump())
+    loop = asyncio.get_running_loop()
+    # The interval runs from our last write to the client, not from the last
+    # line the agent sent. An agent that heartbeats with its own SSE comments
+    # would otherwise keep resetting the timer on lines we drop, and nothing
+    # would reach the browser at all.
+    next_keepalive = loop.time() + KEEPALIVE_INTERVAL
     try:
         while True:
             try:
-                item = await asyncio.wait_for(queue.get(), timeout=KEEPALIVE_INTERVAL)
+                item = await asyncio.wait_for(
+                    queue.get(), timeout=max(0.0, next_keepalive - loop.time())
+                )
             except asyncio.TimeoutError:
                 yield ": keep-alive\n\n"
+                next_keepalive = loop.time() + KEEPALIVE_INTERVAL
                 continue
 
             if item is done:
@@ -122,6 +131,7 @@ async def _agent_sse_frames(response):
                 raise item
             if item.startswith("data: "):
                 yield f"{item}\n\n"
+                next_keepalive = loop.time() + KEEPALIVE_INTERVAL
     finally:
         pump_task.cancel()
 

@@ -1307,12 +1307,20 @@
 
         if (!streamRow) {
           typingDiv.remove();
-          addMessageRow(streamError || "No response received.", "agent");
         }
 
-        // An empty assistant turn would be replayed on every later request,
-        // so only record the exchange when the agent actually answered.
-        if (fullReply) {
+        // A failure can arrive after some tokens have already rendered, so show
+        // it alongside whatever streamed rather than letting a truncated answer
+        // pass for a complete one.
+        if (streamError) {
+          addMessageRow(streamError, "agent");
+        } else if (!streamRow) {
+          addMessageRow("No response received.", "agent");
+        }
+
+        // An empty or truncated turn would be replayed on every later request,
+        // so only record the exchange when the agent answered in full.
+        if (fullReply && !streamError) {
           conversationHistory.push({ role: "user", content: message });
           conversationHistory.push({ role: "assistant", content: fullReply });
         }
