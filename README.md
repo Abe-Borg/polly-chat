@@ -28,9 +28,12 @@ polly-app/
 ├── static/
 │   └── index.html               # Single-file frontend (HTML + CSS + JS)
 ├── scripts/
-│   └── deploy.sh                # Pull, install, restart, health-check, roll back on failure
+│   ├── deploy.sh                # Pull, install, restart, health-check, roll back on failure
+│   └── export_agent_config.py   # Copies the DO agent's config into deploy/agent-config.json
 ├── deploy/
-│   └── polly-chat.service       # The droplet's systemd unit, version controlled
+│   ├── polly-chat.service       # The droplet's systemd unit, version controlled
+│   └── agent-config.json        # The DO agent's config (secrets redacted) — created by
+│                                #   the first run of export_agent_config.py, then committed
 ├── .github/workflows/deploy.yml # Deploys to the droplet on every push to master
 ├── requirements.txt             # Python dependencies
 ├── .gitignore
@@ -81,6 +84,66 @@ Open [http://localhost:8000](http://localhost:8000) in your browser.
 5. The platform handles chunking, embedding, and indexing automatically
 6. Update the agent's system instructions to reference the knowledge base for course-specific questions
 
+## Who owns what
+
+This repository is one half of a two-part system. The other half is the agent's
+configuration on DigitalOcean — its persona, its course documents, its model
+settings. That half is not code here, but it decides how the app behaves just as
+much as this code does, and most confusion about this project comes from trying
+to reason about one half without seeing the other.
+
+The rule that settles where anything belongs:
+
+> **Does it depend on who is asking, or when? → this app.**
+> **Is it identical for every student on every request? → the agent.**
+
+| Concern | Owner | Where it lives |
+|---------|-------|----------------|
+| Persona, tone, refusal policy | **DO agent** | `instruction` |
+| Course knowledge (syllabus, readings) | **DO agent** | Knowledge bases |
+| Retrieval tuning (`k`, `retrieval_method`) | **DO agent** | Agent settings |
+| Model and sampling (`model`, `temperature`, `top_p`, `max_tokens`) | **DO agent** | Agent settings |
+| Content safety | **DO agent** | Guardrails |
+| Regression-testing the agent's answers | **DO agent** | Evaluations |
+| Current date and time | **this app** | `get_time_context()` in `main.py` |
+| Conversation history | **this app** | `conversationHistory` in `static/index.html` |
+| SSE transport, keep-alives, timeouts | **this app** | `_agent_sse_frames()` in `main.py` |
+| Surfacing upstream errors to the student | **this app** | `_error_event()` in `main.py` |
+| Markdown rendering, code blocks | **this app** | `static/index.html` |
+| Theme, font size, UI preferences | **this app** | browser `localStorage` |
+| Authentication, rate limiting, request logging | **nobody yet** | see [Known gaps](#known-gaps) |
+
+The agent is stateless. Its endpoint is OpenAI-shaped chat completions: the full
+`messages` array goes up on every call and tokens come back, and nothing is
+retained between calls. `conversationHistory` in the browser is therefore the
+only memory anywhere in the system — a page refresh is the system forgetting.
+
+### The app never sends a system role
+
+Because the persona belongs to the agent, `build_messages()` sends only `user`
+and `assistant` turns. A client-supplied `system` message would either be
+rejected by the agent or silently compete with the configured `instruction`, and
+which of the two happened would not be visible from here.
+
+Request-scoped context the platform cannot know — currently just the time — is
+folded into the user turn instead. If you ever need the assistant to *behave*
+differently, that change belongs in the agent's `instruction`, not here.
+
+### Known gaps
+
+Written down so they stay decisions rather than surprises:
+
+- **No persistence.** History dies with the tab.
+- **No authentication or rate limiting.** Anyone who can reach the app can spend
+  agent budget.
+- **No request logging.** Real student questions are never recorded, so the
+  agent's Evaluations can only be built from prompts written by hand rather than
+  from questions students actually ask.
+- **Citations are discarded.** The agent emits `[[C1]]`-style markers when
+  `provide_citations` is on; `parseMarkdown()` in `static/index.html` strips them
+  with a regex. Setting `include_retrieval_info` on the request would also return
+  the source files behind each answer.
+
 ## Architecture
 
 The frontend is a single `index.html` file with no build step. It streams Server-Sent Events from the FastAPI backend, which proxies requests to the DigitalOcean agent's `/api/v1/chat/completions` endpoint using `httpx`.
@@ -104,7 +167,12 @@ Student Browser → Nginx → FastAPI (main.py)
 
 ### How Date/Time Injection Works
 
-Every request from the frontend passes through `main.py` before reaching the Gradient agent. The backend prepends a system message containing the current date, time, and day of the week in Pacific Time. This means the agent always knows "today" without needing function calling or external APIs. Example injected message:
+Every request from the frontend passes through `main.py` before reaching the
+Gradient agent, which prepends the current date, time, and day of the week in
+Pacific Time to the user's message. This means the agent always knows "today"
+without needing function calling or external APIs. It travels in the user turn
+rather than as a system message, because the persona belongs to the agent — see
+[Who owns what](#who-owns-what). Example injected text:
 
 ```
 Current date and time: Friday, February 21, 2026, 03:45 PM PST.
@@ -167,15 +235,68 @@ location /api/ {
 
 ## Environment Variables
 
-| Variable       | Description                                      |
-|----------------|--------------------------------------------------|
-| `DO_AGENT_URL` | Base URL of your DigitalOcean Gradient AI agent  |
-| `DO_API_KEY`   | API key for authenticating with the agent         |
+| Variable              | Required | Description                                                        |
+|-----------------------|----------|--------------------------------------------------------------------|
+| `DO_AGENT_URL`        | yes      | Base URL of your DigitalOcean Gradient AI agent                     |
+| `DO_API_KEY`          | yes      | The agent's own key. Talks to the agent; cannot read configuration. |
+| `DO_MANAGEMENT_TOKEN` | no       | A DigitalOcean personal access token, read scope. Used only by `scripts/export_agent_config.py`. The app never reads it. |
+
+`DO_API_KEY` and `DO_MANAGEMENT_TOKEN` are different credentials and are not
+interchangeable — the first authenticates to the agent's inference endpoint, the
+second to DigitalOcean's management API. Using one where the other is expected
+produces a 401.
 
 Both values are trimmed of surrounding whitespace on load, and a trailing slash
 on `DO_AGENT_URL` is ignored. A key pasted into a control panel or an
 `EnvironmentFile` frequently picks up a trailing newline, which otherwise
 produces a malformed `Authorization` header and a 401 from the agent.
+
+## Keeping the agent's configuration in git
+
+The agent's settings live in DigitalOcean's control panel, where they cannot be
+reviewed, diffed, or rolled back. `scripts/export_agent_config.py` copies them
+into `deploy/agent-config.json` so a change to the agent shows up in `git diff`
+alongside changes to the code.
+
+**One-time setup.** Create a personal access token at
+[cloud.digitalocean.com/account/api/tokens](https://cloud.digitalocean.com/account/api/tokens)
+with read scope, and add it to `.env`:
+
+```
+DO_MANAGEMENT_TOKEN=dop_v1_...
+```
+
+**Then, from the repository root:**
+
+```bash
+venv\Scripts\python scripts\export_agent_config.py     # Windows
+# venv/bin/python scripts/export_agent_config.py        # macOS/Linux/droplet
+```
+
+It finds the right agent by matching `DO_AGENT_URL` against each agent's
+deployment URL. If nothing matches and the account has more than one agent, it
+prints them and asks you to re-run with `--agent-uuid <uuid>`.
+
+The script prints a summary of every setting that governs behaviour — model,
+temperature, `k`, `retrieval_method`, `provide_citations`, attached knowledge
+bases and guardrails, and the full `instruction` — then writes the JSON. Values
+that look like credentials are replaced with their length, and fields that
+change on their own (`updated_at`, indexing status, usage counters) are dropped,
+so repeated exports of an unchanged agent are byte-identical and a diff only
+ever shows a real change.
+
+The first run creates `deploy/agent-config.json`; it is not in the repository
+until someone with a management token runs the export, because only an account
+holding the agent can produce it. Commit it once it exists.
+
+**Run it again whenever you change the agent**, and commit the result with a
+message saying what you changed and why. That file is the record of the half of this
+system that is not code. Reviewing a change to the persona then works the same
+way as reviewing a change to `main.py`.
+
+> The export is read-only: it never writes to DigitalOcean. Editing
+> `deploy/agent-config.json` does not change the agent — the control panel is
+> still where changes are made. The file is the record, not the source.
 
 ## Deployment
 
@@ -408,10 +529,12 @@ sudo tr '\0' '\n' < /proc/$(systemctl show -p MainPID --value polly-chat)/enviro
   | grep -E '^DO_' | sed 's/=.*/=<set>/'
 ```
 
-### Compatibility with agents that reject a system role
+### The agent rejects something the app sent
 
-The date/time context is sent as a leading `system` message. Agents configured
-with their own platform-side system prompt may reject a client-supplied one
-with a 400. When that happens the backend automatically retries the request
-once with the same context folded into the user turn, so time awareness keeps
-working either way.
+The app sends only `user` and `assistant` turns, so a 4xx naming a role or
+message is not a system-role rejection — earlier versions of this app sent a
+leading `system` message and retried once without it, and that retry is gone.
+Look instead at the conversation history the browser sent: it is not validated
+or capped, so a malformed entry or a history long enough to exceed the model's
+context window reaches the agent as-is. `agent_detail` in the error frame
+carries the agent's own explanation.
