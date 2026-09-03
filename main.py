@@ -55,31 +55,21 @@ class ChatRequest(BaseModel):
     conversation_history: list = []
 
 
-def build_messages(request: "ChatRequest", inline_time: bool) -> list:
+def build_messages(request: "ChatRequest") -> list:
     """Assemble the outgoing message list.
 
-    Normally the time context rides as a leading system message. When the agent
-    rejects a client-supplied system role, `inline_time` folds the same context
-    into the user turn instead.
+    This app never sends a `system` role. The agent's persona is owned entirely
+    by its platform-side `instruction` on DigitalOcean, so a client-supplied
+    system message would either be rejected outright or quietly compete with the
+    configured persona — and which of the two happened would not be visible from
+    here. See README, "Who owns what".
+
+    What this app does own is request-scoped context the platform cannot know.
+    Today that is the current time, and it rides in the user turn.
     """
-    time_context = get_time_context()
-    if inline_time:
-        return request.conversation_history + [
-            {"role": "user", "content": f"{time_context}\n\n{request.message}"}
-        ]
-    return (
-        [{"role": "system", "content": time_context}]
-        + request.conversation_history
-        + [{"role": "user", "content": request.message}]
-    )
-
-
-def _is_role_rejection(status_code: int, body: str) -> bool:
-    """Does this look like the agent refusing the system role we sent?"""
-    if status_code not in (400, 422):
-        return False
-    lowered = body.lower()
-    return "role" in lowered or "system" in lowered
+    return request.conversation_history + [
+        {"role": "user", "content": f"{get_time_context()}\n\n{request.message}"}
+    ]
 
 
 def _error_event(message: str, detail: str = "") -> str:
@@ -147,43 +137,31 @@ async def chat(request: ChatRequest):
             "Content-Type": "application/json",
         }
         async with httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=15.0)) as client:
-            # Second pass retries without a system role if the agent rejects one.
-            for inline_time in (False, True):
-                messages = build_messages(request, inline_time)
-                try:
-                    async with client.stream(
-                        "POST",
-                        f"{DO_AGENT_URL}{AGENT_PATH}",
-                        headers=headers,
-                        json={"messages": messages, "stream": True},
-                    ) as response:
-                        if response.status_code != 200:
-                            body = (await response.aread()).decode(errors="replace")
-                            if not inline_time and _is_role_rejection(response.status_code, body):
-                                logger.warning(
-                                    "Agent rejected the system role (HTTP %s); "
-                                    "retrying with the time context inline",
-                                    response.status_code,
-                                )
-                                continue
-                            logger.error(
-                                "Agent returned HTTP %s: %s", response.status_code, body[:500]
-                            )
-                            yield _error_event(
-                                f"The agent returned HTTP {response.status_code}.", body[:500]
-                            )
-                            return
-
-                        async for frame in _agent_sse_frames(response):
-                            yield frame
+            try:
+                async with client.stream(
+                    "POST",
+                    f"{DO_AGENT_URL}{AGENT_PATH}",
+                    headers=headers,
+                    json={"messages": build_messages(request), "stream": True},
+                ) as response:
+                    if response.status_code != 200:
+                        body = (await response.aread()).decode(errors="replace")
+                        logger.error(
+                            "Agent returned HTTP %s: %s", response.status_code, body[:500]
+                        )
+                        yield _error_event(
+                            f"The agent returned HTTP {response.status_code}.", body[:500]
+                        )
                         return
 
-                except httpx.HTTPError as exc:
-                    logger.exception("Request to the agent failed")
-                    yield _error_event(
-                        "Could not reach the agent.", f"{type(exc).__name__}: {exc}"
-                    )
-                    return
+                    async for frame in _agent_sse_frames(response):
+                        yield frame
+
+            except httpx.HTTPError as exc:
+                logger.exception("Request to the agent failed")
+                yield _error_event(
+                    "Could not reach the agent.", f"{type(exc).__name__}: {exc}"
+                )
 
     return StreamingResponse(
         stream_response(),
