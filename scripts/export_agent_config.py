@@ -65,25 +65,35 @@ KEY_SETTINGS = (
 )
 
 
-def redact(value, key_name: str = ""):
+def redact(value, key_name: str = "", inherited_secret: bool = False):
     """Recursively replace anything credential-shaped with a placeholder.
 
-    The output file is committed, so it must never carry a secret. Values are
+    The output file is committed, so it must never carry a secret. Strings are
     replaced by their length alone, which is enough to tell "this is set" from
     "this is empty" without revealing the value.
+
+    Sensitivity is inherited by everything below a credential-shaped key. A
+    secret is just as exposed at `credential.value` as it is at `credential`,
+    and only the outer key is recognisable as a credential, so matching on the
+    key alone would write the nested one out verbatim. Structure and non-string
+    scalars survive the redaction, so the shape of the configuration — how many
+    keys exist, what they are called — stays readable.
     """
-    lowered = key_name.lower()
-    if any(hint in lowered for hint in SECRET_HINTS) and isinstance(value, str):
+    is_secret = inherited_secret or any(
+        hint in key_name.lower() for hint in SECRET_HINTS
+    )
+
+    if isinstance(value, str) and is_secret:
         return f"<redacted: {len(value)} chars>" if value else "<empty>"
 
     if isinstance(value, dict):
         return {
-            k: redact(v, k)
+            k: redact(v, k, is_secret)
             for k, v in sorted(value.items())
             if k not in VOLATILE_FIELDS
         }
     if isinstance(value, list):
-        return [redact(item, key_name) for item in value]
+        return [redact(item, key_name, is_secret) for item in value]
     return value
 
 
@@ -108,10 +118,29 @@ def request_json(client: httpx.Client, url: str) -> dict:
     return response.json()
 
 
+def list_agents(client: httpx.Client) -> list:
+    """Collect every agent, following DigitalOcean's pagination links.
+
+    An account holding more agents than fit on one page would otherwise look as
+    though it does not contain the agent this app talks to, and auto-detection
+    would fail on an agent that exists.
+    """
+    url = f"{API_ROOT}?per_page=200"
+    agents: list = []
+    visited: set = set()
+
+    while url and url not in visited:
+        visited.add(url)
+        payload = request_json(client, url)
+        agents.extend(payload.get("agents") or [])
+        url = ((payload.get("links") or {}).get("pages") or {}).get("next")
+
+    return agents
+
+
 def find_agent_uuid(client: httpx.Client, agent_url: str) -> str:
     """Pick the agent to export, preferring the one this app actually calls."""
-    payload = request_json(client, API_ROOT)
-    agents = payload.get("agents") or []
+    agents = list_agents(client)
 
     if not agents:
         sys.exit("The token is valid, but this account has no agents.")

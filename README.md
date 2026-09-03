@@ -32,7 +32,8 @@ polly-app/
 │   └── export_agent_config.py   # Copies the DO agent's config into deploy/agent-config.json
 ├── deploy/
 │   ├── polly-chat.service       # The droplet's systemd unit, version controlled
-│   └── agent-config.json        # The DO agent's config, version controlled (secrets redacted)
+│   └── agent-config.json        # The DO agent's config (secrets redacted) — created by
+│                                #   the first run of export_agent_config.py, then committed
 ├── .github/workflows/deploy.yml # Deploys to the droplet on every push to master
 ├── requirements.txt             # Python dependencies
 ├── .gitignore
@@ -284,8 +285,12 @@ change on their own (`updated_at`, indexing status, usage counters) are dropped,
 so repeated exports of an unchanged agent are byte-identical and a diff only
 ever shows a real change.
 
-**Run it whenever you change the agent**, and commit the result with a message
-saying what you changed and why. That file is the record of the half of this
+The first run creates `deploy/agent-config.json`; it is not in the repository
+until someone with a management token runs the export, because only an account
+holding the agent can produce it. Commit it once it exists.
+
+**Run it again whenever you change the agent**, and commit the result with a
+message saying what you changed and why. That file is the record of the half of this
 system that is not code. Reviewing a change to the persona then works the same
 way as reviewing a change to `main.py`.
 

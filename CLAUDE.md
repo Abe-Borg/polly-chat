@@ -11,7 +11,8 @@ science course, used by students.
 - `main.py` — the whole backend, ~230 lines. Proxies SSE, injects time, reports health.
 - `static/index.html` — the whole frontend. No build step, no framework.
 - `scripts/deploy.sh` — deploys to the droplet; run over SSH by the GitHub Actions workflow.
-- `scripts/export_agent_config.py` — copies the DO agent's config into `deploy/agent-config.json`.
+- `scripts/export_agent_config.py` — copies the DO agent's config into
+  `deploy/agent-config.json`, which that script creates on its first run.
 
 ## The two halves — read this before changing behaviour
 
@@ -25,7 +26,9 @@ model, sampling settings, retrieval tuning, and guardrails. `README.md` →
 
 **Before changing how the assistant talks, sounds, or refuses, stop.** That is
 the agent's `instruction`, not this code. Read `deploy/agent-config.json` to see
-what it currently says. Changing it means changing it in the DigitalOcean
+what it currently says — and if that file is not present, it means nobody has
+run `scripts/export_agent_config.py` yet, so the agent's half of the system is
+still unrecorded. Changing the persona means changing it in the DigitalOcean
 control panel and re-running the export.
 
 ## Invariants — do not break these without a deliberate decision
